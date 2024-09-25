@@ -28,7 +28,7 @@ jobs:
       - name: Load JSON file
         shell: pwsh
         run: |
-          $json = Get-Content 'Example TF Plan.json' | ConvertFrom-Json
+          $json = Get-Content './.github/workflows/Example TF Plan.json' | ConvertFrom-Json
           echo "Address: $($json[0].address)"
 
       
