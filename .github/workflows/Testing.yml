@@ -25,8 +25,10 @@ jobs:
       - name: "Checkout git ref"
         uses: actions/checkout@v4 # https://github.com/marketplace/actions/checkout 
 
-      # TODO: Consider adding TF linting and/or Sentinel Testing here for ever better validation.
-      - name: Testing
-        id: testing
+      - name: Load JSON file
+        shell: pwsh
         run: |
-          echo "Hello world!"
+          $json = Get-Content 'Example TF Plan.json' | ConvertFrom-Json
+          echo "Address: $($json[0].address)"
+
+      

@@ -1,0 +1,258 @@
+# PURPOSE: Reuseable workflow that runs a speculative (plan only) run on an FMG Terraform Cloud workspace.
+# IMPORTANT: Behaviour should be idempotent to allow repeatability without unexpected side effects.
+# REQUIRES `Read and write permissions` as a step includes a script that will upsert a PR comment.
+# SOURCE: https://github.com/hashicorp/tfc-workflows-github/blob/main/workflow-templates/terraform-cloud.speculative-run.workflow.yml
+# SEE ALSO:
+# https://developer.hashicorp.com/terraform/internals/json-format
+# https://docs.github.com/en/actions/using-workflows/reusing-workflows
+name: Terraform Plan
+run-name: ${{ inputs.workspace }} Terraform Plan
+on:
+  # Setup triggering from another workflow
+  workflow_call:
+    inputs:
+        workspace:
+          type: string
+          description: 'Name of the Terraform workspace to run the plan on'
+          required: true
+        config-directory:
+            type: string
+            description: 'Terraform config. directory, relative to project root'
+            required: true
+        timeout:
+            type: string
+            description: 'Terraform workspace timeout. Default is 1 hour'
+            required: false
+            default: "1h"
+    secrets:
+        api-token:
+          description: 'Terraform API token that includes Plan permissions.'
+          required: true
+  
+    outputs:
+      status:
+        description: "Status of the Terraform Plan. Values: no-op, changed, failed."
+        value: ${{ jobs.terraform-cloud-speculative-run.outputs.status }}
+      add-count:
+        description: "Count of resources to be added in the Terraform Plan."
+        value: ${{ jobs.terraform-cloud-speculative-run.outputs.add-count }}
+      update-count:
+        description: "Count of resources to be updated in the Terraform Plan."
+        value: ${{ jobs.terraform-cloud-speculative-run.outputs.update-count }}
+      destroy-count:
+        description: "Count of resources to be destroyed in the Terraform Plan."
+        value: ${{ jobs.terraform-cloud-speculative-run.outputs.destroy-count }}   
+      resource-changes:
+        description: "Resources affected by the Terraform Plan (if any) in JSON format."
+        value: ${{ jobs.terraform-cloud-speculative-run.outputs.resource-changes-json }}
+
+# Shared Environment Variables
+# IMPORTANT: Some actions read these values implicitly i.e. they may not appear in below code.
+env:
+  TF_CLOUD_ORGANIZATION: "${{ vars.TF_CLOUD_ORGANISATION }}"
+  TF_API_TOKEN: ${{secrets.api-token}} # Workspace specific Plan token from https://app.terraform.io/app/farmersmutualgroup/settings/teams.
+  TF_WORKSPACE: ${{ inputs.workspace }} # Name of existing workspace in Terraform Cloud.    
+  CONFIG_DIRECTORY: ${{ inputs.config-directory }} # Terraform config. directory, relative to project root.
+  TF_MAX_TIMEOUT: ${{ inputs.timeout }} # Default is 1h (1 hour), can also use e.g. 30m for 30 mins.
+  # TF_LOG: DEBUG # Helpful for troubleshooting
+
+# Save computation resources by cancelling any in-progress runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  terraform-cloud-speculative-run:
+    name: "Speculative run"
+    runs-on: ubuntu-latest
+    outputs: 
+      status: ${{ steps.status.outputs.value || 'failed' }}
+      add-count: ${{ steps.plan-summary.outputs.add }}
+      update-count: ${{ steps.plan-summary.outputs.change }}
+      destroy-count: ${{ steps.plan-summary.outputs.destroy }}
+      resource-changes-json: ${{ steps.resource-changes-json.outputs.value }}
+
+    steps:
+      - name: "Checkout git ref"
+        uses: actions/checkout@v4 # https://github.com/marketplace/actions/checkout 
+
+      # TODO: Consider adding TF linting and/or Sentinel Testing here for ever better validation.
+      - name: Validate Terraform code
+        id: validate
+        run: terraform validate -no-color
+              
+      - name: "Check Terraform format"
+        id: format
+        run: terraform fmt -check
+              
+      - name: "Upload configuration to Terraform Cloud"
+        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.2.0 # Specific version required e.g. @v1 not supported.
+        id: upload
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          directory: ${{ env.CONFIG_DIRECTORY }}
+          speculative: true
+
+      - name: "Create Run"
+        uses: hashicorp/tfc-workflows-github/actions/create-run@v1.2.0 # Specific version required e.g. @v1 not supported.
+        id: run
+        # run may fail, if so continue to output PR comment        
+        continue-on-error: true
+        with:
+          workspace: ${{ env.TF_WORKSPACE }}
+          configuration_version: ${{ steps.upload.outputs.configuration_version_id }}
+          plan_only: true
+          message: "Triggered from GitHub Actions by ${{ github.actor }} (SHA: ${{ github.sha }})"
+
+      - name: "Get Plan summary"
+        uses: hashicorp/tfc-workflows-github/actions/plan-output@v1.2.0 # Specific version required e.g. @v1 not supported.
+        id: plan-summary
+        with:
+          plan: ${{ steps.run.outputs.plan_id }}
+
+      # NOTE: 'steps.run.outputs.payload).data.attributes.actions.IsConfirmable' doesn't indicate a Plan has changes for speculative only runs.
+      - name: "Set Plan has changes state"
+        id: plan-has-changes
+        run: |
+          delta=$((${{ steps.plan-summary.outputs.add }} + ${{ steps.plan-summary.outputs.change }} + ${{ steps.plan-summary.outputs.destroy }}))
+          if (( delta > 0 )); then
+            echo "value=true" >> $GITHUB_OUTPUT
+          else
+            echo "value=false" >> $GITHUB_OUTPUT
+          fi      
+  
+      # See: https://developer.hashicorp.com/terraform/cloud-docs/api-docs/plans#retrieve-the-json-execution-plan      
+      - name: Output JSON Resource changes to file
+        if: ${{ steps.plan-has-changes.outputs.value == 'true' }}
+        shell: pwsh
+        run: |
+          $resourceChanges = $null  
+          $url = "https://app.terraform.io/api/v2/plans/${{ steps.run.outputs.plan_id }}/json-output-redacted"
+          $response = Invoke-RestMethod -Uri $url -Method Get -ContentType "application/vnd.api+json" -Headers @{
+            Authorization = "Bearer ${{ env.TF_API_TOKEN}}"
+          }
+          if ($response.resource_changes){
+            # Filter out no-op resources which aren't plan changes.
+            $resourceChanges = $response.resource_changes | where { $_.change.actions[0] -ne "no-op" }
+          }
+
+          if ($resourceChanges){
+            $resourceChanges | ConvertTo-Json -Depth 100 | Set-Content resource-changes.json -Encoding UTF8
+          } else {
+            "" | Set-Content resource-changes.json
+          }
+
+      # See: https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#example-of-a-multiline-string
+      - name: Escape JSON Resource changes for GitHub output
+        if: ${{ steps.plan-has-changes.outputs.value == 'true' }}
+        id: resource-changes-json
+        run: |
+          {
+            echo 'value<<EOF'
+            cat resource-changes.json
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          
+      # Publish artifacts prior to other steps as useful for debugging.
+      - name: Publish JSON Resource changes artifact
+        if: ${{ steps.plan-has-changes.outputs.value == 'true' }}
+        id: resource-changes-artifact
+        uses: actions/upload-artifact@v4 # https://github.com/marketplace/actions/upload-a-build-artifact
+        with:
+          name: Resource changes
+          path: ./resource-changes.json
+
+      # See: https://github.com/robburger/terraform-pr-commenter/issues/6#issuecomment-826966670
+      - name: Escape and truncate JSON Resource changes for PR comments
+        if: ${{ steps.plan-has-changes.outputs.value == 'true' }}
+        id: resource-changes-json-truncated
+        run: |
+          resourceChanges=$(cat resource-changes.json)
+          {
+            echo "value<<EOF"
+            echo "${resourceChanges:0:65536}"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"      
+
+      # REQUIRED: Workflow permissions: `Read and write permissions`
+      - name: "Add Terraform Cloud Plan output to PR comments"
+        uses: actions/github-script@v7 # https://github.com/actions/github-script/tree/v7            
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Id to make the comment unique/searchable especially if other Github actions add comments to the PR.
+            const commentFindId = `Id: TFC Plan ${{ github.workflow }}`
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes(commentFindId)
+            })
+
+            const output = `#### Terraform Cloud Plan Output (${{ github.workflow }})
+            <!-- ${commentFindId} -->
+            **Plan:** ${{ steps.plan-summary.outputs.add }} to add, ${{ steps.plan-summary.outputs.change }} to update, ${{ steps.plan-summary.outputs.destroy }} to destroy.
+            **Validation:** ${{ steps.validate.outcome }}
+            **Format:** ${{ steps.format.outcome }}
+            <details open>
+            <summary>Resource changes</summary>            
+            \n\`\`\`json
+            ${{ steps.resource-changes-json-truncated.outputs.value || '(None)' }}
+            \`\`\`\n
+            [Untruncated Resource changes available in workflow artifact](${{ steps.resource-changes-artifact.outputs.artifact-url }})
+            </details>
+            `
+            // 2. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+          
+      # Create Job summary prior to decision to fail job as is useful for debugging.
+      - name: "Create Job summary"
+        run: |
+          echo "### Terraform Plan output :clipboard:" >> $GITHUB_STEP_SUMMARY
+          echo "**Plan**: [${{ steps.plan-summary.outputs.add }} to add, ${{ steps.plan-summary.outputs.change }} to update, ${{ steps.plan-summary.outputs.destroy }} to destroy](${{ steps.run.outputs.run_link }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Validation**: ${{ steps.validate.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Format**: ${{ steps.format.outcome }}" >> $GITHUB_STEP_SUMMARY  
+  
+      - name: "Fail job if not planned and finished"
+        id: terraform-cloud-check-run-status
+        if: ${{ steps.run.outputs.run_status != 'planned_and_finished' }}
+        run: |
+          echo "Terraform Cloud Run failed or requires further attention!"
+          echo "Run Status: '${{ steps.run.outputs.run_status }}'"
+          echo "${{ steps.run.outputs.run_link }}"
+          exit 1
+
+      - name: "Fail job if Terraform validation failed"
+        id: validation-status
+        if: ${{ steps.validate.outcome != 'success' }}
+        run: |
+          echo "Terraform validation failed!"
+          echo "${{ steps.validate.outputs.stdout }}
+          exit 1
+
+      - name: "Set Output status"
+        id: status
+        run: |
+          if [ ${{ steps.plan-has-changes.outputs.value }} == true ]; then
+            echo "value=changed" >> $GITHUB_OUTPUT
+          else
+            echo "value=no-op" >> $GITHUB_OUTPUT
+          fi
