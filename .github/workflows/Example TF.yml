@@ -5,7 +5,7 @@
 # SEE ALSO:
 # https://developer.hashicorp.com/terraform/internals/json-format
 # https://docs.github.com/en/actions/using-workflows/reusing-workflows
-name: Terraform Plan
+name: Terraform Plan Example
 run-name: ${{ inputs.workspace }} Terraform Plan
 on:
   # Setup triggering from another workflow
