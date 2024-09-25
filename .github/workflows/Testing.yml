@@ -27,6 +27,6 @@ jobs:
 
       # TODO: Consider adding TF linting and/or Sentinel Testing here for ever better validation.
       - name: Testing
-        id: testing+
+        id: testing
         run: |
           echo "Hello world!"
