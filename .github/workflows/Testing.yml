@@ -25,10 +25,10 @@ jobs:
       - name: "Checkout git ref"
         uses: actions/checkout@v4 # https://github.com/marketplace/actions/checkout 
 
-      - name: Load JSON file
+      - name: Load example Terraform Plan from file
         shell: pwsh
         run: |
-          $json = Get-Content './.github/workflows/Example TF Plan.json' | ConvertFrom-Json
+          $json = Get-Content '.github/workflows/Example TF Plan.json' | ConvertFrom-Json
           echo "Address: $($json[0].address)"
 
       
