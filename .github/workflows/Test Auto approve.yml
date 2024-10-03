@@ -1,0 +1,88 @@
+name: Test Auto approve
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+
+    outputs: 
+      runDev: ${{ steps.set_output.outputs.runDev }}
+      runProd: ${{ steps.set_output.outputs.runProd }}
+      devApprovalNeeded: ${{ steps.set_output.outputs.devApprovalNeeded }}
+
+    steps:
+      - name: Run tests
+        run: echo "Running init"
+
+      - name: set output
+        id: set_output
+        run: |
+          echo "runDev=true" >> $GITHUB_OUTPUT
+          echo "runProd=true" >> $GITHUB_OUTPUT
+          echo "devApprovalNeeded=false" >> $GITHUB_OUTPUT
+  
+  deployDev:
+    runs-on: ubuntu-latest
+    name: Deploy to DEV
+    environment: DEV
+    needs: init
+
+    if: needs.init.outputs.runDev == 'true'    
+    steps:
+      - name: deploy dev
+        run: echo "Deploying to DEV" >> $GITHUB_STEP_SUMMARY
+  
+  deployDevAutoApprove:
+    runs-on: ubuntu-latest
+    name: Deploy to DEV Auto Approve
+    needs: init
+
+    env:
+      GH_TOKEN: ${{ secrets.GH_DEPLOY_PAT }}
+      # GH_TOKEN: ${{ github.token }} doesn't work
+
+    # permissions: write-all # not needed with PAT
+
+    if: needs.init.outputs.runDev == 'true' && needs.init.outputs.devApprovalNeeded != 'true'
+
+    steps:
+      - run: echo "Deploy to DEV Auto Approved" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Get Environment Id
+        id: environment-id
+        run: |
+          envs=$(gh api repos/${{ github.repository }}/environments)
+          environmentId=$(echo $envs | jq -r '.environments[] | select(.name=="DEV") | .id')
+          echo "ENVID=$environmentId" >> $GITHUB_ENV
+      
+      - name: Get Pending Deployments
+        id: pending-deployments
+        run: |
+          gh api /repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/pending_deployments
+		      # just forcing auto-approve here, I improved the check later
+          echo "pending=true" >> $GITHUB_OUTPUT
+      
+      - name: Approve Pending Deployment
+        if: steps.pending-deployments.outputs.pending != '[]'
+        run: |
+          gh api --method POST                            \
+            -F "environment_ids[]=$ENVID"                 \
+            -f "state=approved"                           \
+            -f "comment=Auto-Approved by GitHub Actions"  \
+            --verbose \
+            repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/pending_deployments
+
+  deployProd:
+    runs-on: ubuntu-latest
+    name: Deploy to PROD
+    environment: PRD
+    needs: [init, deployDev]
+
+    if: ${{ needs.init.outputs.runProd == 'true' }}
+
+    steps:
+      - name: deploy prod
+        run: echo "Deploying to PRD" >> $GITHUB_STEP_SUMMARY
